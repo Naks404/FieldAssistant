@@ -2,6 +2,7 @@ import cv2
 import numpy as np
 import collections
 import math
+import time
 
 class ExposureAnalyzer:
     def __init__(self):
@@ -9,9 +10,9 @@ class ExposureAnalyzer:
         self.TARGET_LUM = 115.0
         self.EV_TOLERANCE = 25.0
         self.HARD_CLIP_RATIO = 0.10
-        self.MOTION_THRESH = 5.0      
-        self.SNR_THRESH = 15.0        
-        self.DEPTH_FLAT_THRESH = 2.0  
+        self.MOTION_THRESH = 15.0      
+        self.SNR_THRESH = 500.0        
+        self.DEPTH_FLAT_THRESH = 200.0  
         
         self.WB_SLOPE = 1.173384
         self.WB_INTERCEPT = -0.215403
@@ -29,7 +30,8 @@ class ExposureAnalyzer:
         self.feature_params = dict(maxCorners=200, qualityLevel=0.05, minDistance=7, blockSize=7)
         self.lk_params = dict(winSize=(15, 15), maxLevel=2, criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03))
 
-        self.frame_count = 0
+        self.last_noise_time = time.time()
+        self.last_wb_depth_time = time.time()
 
         # --- CACHED NATIVE METRICS ---
         self.current_metrics = {
@@ -38,23 +40,44 @@ class ExposureAnalyzer:
         }
 
     def analyze_frame(self, frame_bgr: np.ndarray) -> dict:
-        self.frame_count += 1
-        
+
         gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+
         
+
         # TIER 1: Continuous Evaluation
+
         self._evaluate_exposure(gray)
+
         self._evaluate_motion(gray)
 
-        # TIER 2: 1-Second Cycle (~30fps)
-        if self.frame_count % 30 == 0:
+
+
+        current_time = time.time()
+
+
+
+        # TIER 2: 1-Second Cycle
+
+        if current_time - self.last_noise_time >= 1.0:
+
             self._evaluate_noise(gray)
 
+            self.last_noise_time = current_time
+
+
+
         # TIER 3: 3-Second Cycle
-        if self.frame_count % 90 == 0:
+
+        if current_time - self.last_wb_depth_time >= 3.0:
+
             self._evaluate_white_balance(frame_bgr)
+
             self._evaluate_depth(gray)
-            self.frame_count = 0
+
+            self.last_wb_depth_time = current_time
+
+
 
         return self._resolve_state()
 
@@ -78,13 +101,14 @@ class ExposureAnalyzer:
     def _evaluate_motion(self, gray: np.ndarray):
         median_speed = 0.0
 
-        if self.prev_gray is None or self.prev_pts is None or len(self.prev_pts) < 15 or self.frame_count == 1:
+        if self.prev_gray is None or self.prev_pts is None or len(self.prev_pts) < 15:
             self.prev_pts = cv2.goodFeaturesToTrack(gray, mask=None, **self.feature_params)
             self.prev_gray = gray.copy()
             return
 
         new_pts, status, err = cv2.calcOpticalFlowPyrLK(self.prev_gray, gray, self.prev_pts, None, **self.lk_params)
 
+        good_new = []
         if new_pts is not None and status is not None:
             good_new = new_pts[status == 1]
             good_old = self.prev_pts[status == 1]
@@ -220,20 +244,28 @@ class ExposureAnalyzer:
             response["secondary_action"] = "Too Cold. Add Warm/Orange."
             response["secondary_color"] = "CYAN"
 
-        # --- TEMPORARY CALIBRATION INJECTION ---
-        # Inject the raw values into the secondary_action string so they appear on screen
-        stats_str = f"[SPD: {m['motion_speed']:.1f} | SNR: {m['snr']:.1f} | WB: {m['wb_ratio']:.2f} | DP: {m['depth_ratio']:.1f}]"
-        
-        if response["secondary_action"]:
-            response["secondary_action"] = f"{stats_str}\n{response['secondary_action']}"
-        else:
-            response["secondary_action"] = stats_str
-            # Default to white text if there is no active secondary warning
-            response["secondary_color"] = "WHITE" 
+       
 
         return response
 
     def analyze_frame_nv21(self, nv21_bytes: bytes, width: int, height: int) -> dict:
+        import time
+        start_total = time.time()
+        
         yuv = np.frombuffer(nv21_bytes, dtype=np.uint8).reshape((height + height // 2, width))
         frame_bgr = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_NV21)
-        return self.analyze_frame(frame_bgr)
+        
+        # --- BENCHMARK START ---
+        start_process = time.time()
+        result = self.analyze_frame(frame_bgr)
+        end_process = time.time()
+        
+        total_time = (end_process - start_total) * 1000.0
+        cv_time = (end_process - start_process) * 1000.0
+        jni_mem_time = total_time - cv_time
+        
+        print(f"[BENCHMARK] Exposure | Total: {total_time:.1f}ms | JNI+YUV: {jni_mem_time:.1f}ms | CV: {cv_time:.1f}ms")
+        # -----------------------
+        
+        return result
+        

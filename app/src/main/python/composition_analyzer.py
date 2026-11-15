@@ -192,7 +192,7 @@ class MultiSubjectPersistenceTracker:
 class CompositionAnalyzer:
     """
     Stateful Python engine designed to be instantiated once by Chaquopy.
-    Maintains tracking history across frames.
+    Maintains tracking history across frames and outputs normalized UI overlay primitives.
     """
     def __init__(self, cache_dir=None):
         current_dir = os.path.dirname(__file__)
@@ -210,78 +210,95 @@ class CompositionAnalyzer:
         self.tracker = MultiSubjectPersistenceTracker(max_tracks=3, min_hits=4, max_age=5)
         self.max_proc_dim = 360  # Anchor length for dynamic tensor resizing
 
-    def _generate_feedback(self, faces, objects, w, h):
-        """Semantic Decision Engine integrating geometric and aspect ratio rules."""
+    def _generate_feedback_and_targets(self, faces, objects, w, h):
+        """
+        Semantic Decision Engine integrating geometric and aspect ratio rules.
+        Returns (feedback_text, targets_list) where each target in targets_list is:
+          - "POINT,tx,ty,ax,ay" (for intersection / power-point / center crosshairs)
+          - "HLINE,ty,ax,ay"    (for horizontal Rule-of-Thirds grid line highlights)
+          - "VLINE,tx,ax,ay"    (for vertical Rule-of-Thirds / center grid line highlights)
+        """
         is_portrait = h > w
-        third_x1, third_x2 = w // 3, 2 * (w // 3)
-        third_y1, third_y2 = h // 3, 2 * (h // 3)
+        third_x1, third_x2 = w / 3.0, 2.0 * (w / 3.0)
+        third_y1, third_y2 = h / 3.0, 2.0 * (h / 3.0)
         
         tol_x = w * (0.06 if is_portrait else 0.08)
-        tol_y = h * 0.08 
+        tol_y = h * 0.08
+        targets = []
 
         if len(faces) > 0:
             faces = sorted(faces, key=lambda f: f[0])
             
             if len(faces) == 1:
                 fx, fy, fw, fh = faces[0]
-                face_cx = fx + fw // 2
+                face_cx = fx + fw / 2.0
                 eye_y = fy + fh * 0.35
                 
-                target_x = (w // 2) if is_portrait else (third_x1 if face_cx < w // 2 else third_x2)
+                target_x = (w / 2.0) if is_portrait else (third_x1 if face_cx < w / 2.0 else third_x2)
                 target_y = third_y1
                 
-                if eye_y - target_y > tol_y: return "Move Up (Fix Headroom)"
-                if target_y - eye_y > tol_y: return "Move Down (Fix Headroom)"
-                if face_cx - target_x > tol_x: return "Move Left (Align Face)"
-                if target_x - face_cx > tol_x: return "Move Right (Align Face)"
+                targets.append(f"POINT,{target_x/w:.4f},{target_y/h:.4f},{face_cx/w:.4f},{eye_y/h:.4f}")
                 
-                # Mixed Frame Balancing
+                if eye_y - target_y > tol_y: return "Move Up (Fix Headroom)", targets
+                if target_y - eye_y > tol_y: return "Move Down (Fix Headroom)", targets
+                if face_cx - target_x > tol_x: return "Move Left (Align Face)", targets
+                if target_x - face_cx > tol_x: return "Move Right (Align Face)", targets
+                
+                # Mixed Frame Balancing (1 Face + 1 Salient Object)
                 if len(objects) >= 1:
                     ox, oy, ow, oh = objects[0]
-                    obj_cx, obj_cy = ox + ow // 2, oy + oh // 2
+                    obj_cx, obj_cy = ox + ow / 2.0, oy + oh / 2.0
                     
                     width_pct, height_pct = ow / float(w), oh / float(h)
                     ratio = ow / float(max(1, oh))
                     is_tall = height_pct > 0.33 or ratio < 0.75
                     
-                    diag_x = (w // 2) if is_portrait else (third_x2 if target_x == third_x1 else third_x1)
+                    diag_x = (w / 2.0) if is_portrait else (third_x2 if target_x == third_x1 else third_x1)
                     diag_y = third_y2
                     
-                    if obj_cx - diag_x > tol_x: return "Move Object Left (Balance)"
-                    if diag_x - obj_cx > tol_x: return "Move Object Right (Balance)"
+                    if is_tall:
+                        targets.append(f"VLINE,{diag_x/w:.4f},{obj_cx/w:.4f},{obj_cy/h:.4f}")
+                    else:
+                        targets.append(f"POINT,{diag_x/w:.4f},{diag_y/h:.4f},{obj_cx/w:.4f},{obj_cy/h:.4f}")
+                    
+                    if obj_cx - diag_x > tol_x: return "Move Object Left (Balance)", targets
+                    if diag_x - obj_cx > tol_x: return "Move Object Right (Balance)", targets
                     
                     if not is_tall:
-                        if obj_cy - diag_y > tol_y: return "Move Object Up (Balance)"
-                        if diag_y - obj_cy > tol_y: return "Move Object Down (Balance)"
+                        if obj_cy - diag_y > tol_y: return "Move Object Up (Balance)", targets
+                        if diag_y - obj_cy > tol_y: return "Move Object Down (Balance)", targets
                     
-                return "ALIGNED"
+                return "ALIGNED", targets
 
             elif len(faces) == 2:
                 f1x, f1y, f1w, f1h = faces[0]
-                f1_cx, f1_eye_y = f1x + f1w // 2, f1y + f1h * 0.35
-                
-                if f1_eye_y - third_y1 > tol_y: return "Move Up (Left Person Headroom)"
-                if third_y1 - f1_eye_y > tol_y: return "Move Down (Left Person Headroom)"
-                if f1_cx - third_x1 > tol_x: return "Move Left (Align Left Person)"
-                if third_x1 - f1_cx > tol_x: return "Move Right (Align Left Person)"
-                
+                f1_cx, f1_eye_y = f1x + f1w / 2.0, f1y + f1h * 0.35
                 f2x, f2y, f2w, f2h = faces[1]
-                f2_cx = f2x + f2w // 2
+                f2_cx, f2_eye_y = f2x + f2w / 2.0, f2y + f2h * 0.35
                 
-                if f2_cx - third_x2 > tol_x: return "Move Left (Align Right Person)"
-                if third_x2 - f2_cx > tol_x: return "Move Right (Align Right Person)"
+                targets.append(f"POINT,{third_x1/w:.4f},{third_y1/h:.4f},{f1_cx/w:.4f},{f1_eye_y/h:.4f}")
+                targets.append(f"VLINE,{third_x2/w:.4f},{f2_cx/w:.4f},{f2_eye_y/h:.4f}")
                 
-                return "ALIGNED"
+                if f1_eye_y - third_y1 > tol_y: return "Move Up (Left Person Headroom)", targets
+                if third_y1 - f1_eye_y > tol_y: return "Move Down (Left Person Headroom)", targets
+                if f1_cx - third_x1 > tol_x: return "Move Left (Align Left Person)", targets
+                if third_x1 - f1_cx > tol_x: return "Move Right (Align Left Person)", targets
+                
+                if f2_cx - third_x2 > tol_x: return "Move Left (Align Right Person)", targets
+                if third_x2 - f2_cx > tol_x: return "Move Right (Align Right Person)", targets
+                
+                return "ALIGNED", targets
             else:
-                return "ALIGNED (Wide Shot)"
+                return "ALIGNED (Wide Shot)", targets
 
         else:
             # Objects Only
-            if len(objects) > 3: return "Cluttered Frame: Move Closer"
+            if len(objects) > 3:
+                return "Cluttered Frame: Move Closer", targets
             
             if len(objects) == 1:
                 ox, oy, ow, oh = objects[0]
-                obj_cx, obj_cy = ox + ow // 2, oy + oh // 2
+                obj_cx, obj_cy = ox + ow / 2.0, oy + oh / 2.0
                 
                 width_pct, height_pct = ow / float(w), oh / float(h)
                 ratio = ow / float(max(1, oh))
@@ -289,47 +306,55 @@ class CompositionAnalyzer:
                 is_tall = height_pct > 0.33 or ratio < 0.75
                 
                 if is_wide and is_tall:
-                    target_x, target_y = w // 2, h // 2
-                    if obj_cx - target_x > tol_x: return "Move Left (Center Object)"
-                    if target_x - obj_cx > tol_x: return "Move Right (Center Object)"
-                    if obj_cy - target_y > tol_y: return "Move Up (Center Object)"
-                    if target_y - obj_cy > tol_y: return "Move Down (Center Object)"
+                    target_x, target_y = w / 2.0, h / 2.0
+                    targets.append(f"POINT,{target_x/w:.4f},{target_y/h:.4f},{obj_cx/w:.4f},{obj_cy/h:.4f}")
+                    if obj_cx - target_x > tol_x: return "Move Left (Center Object)", targets
+                    if target_x - obj_cx > tol_x: return "Move Right (Center Object)", targets
+                    if obj_cy - target_y > tol_y: return "Move Up (Center Object)", targets
+                    if target_y - obj_cy > tol_y: return "Move Down (Center Object)", targets
                 elif is_wide:
-                    target_y = third_y1 if obj_cy < h // 2 else third_y2
-                    if obj_cy - target_y > tol_y: return "Move Up (Align Object)"
-                    if target_y - obj_cy > tol_y: return "Move Down (Align Object)"
+                    target_y = third_y1 if obj_cy < h / 2.0 else third_y2
+                    targets.append(f"HLINE,{target_y/h:.4f},{obj_cx/w:.4f},{obj_cy/h:.4f}")
+                    if obj_cy - target_y > tol_y: return "Move Up (Align Object)", targets
+                    if target_y - obj_cy > tol_y: return "Move Down (Align Object)", targets
                 elif is_tall:
-                    target_x = (w // 2) if is_portrait else (third_x1 if obj_cx < w // 2 else third_x2)
-                    if obj_cx - target_x > tol_x: return "Move Left (Align Object)"
-                    if target_x - obj_cx > tol_x: return "Move Right (Align Object)"
+                    target_x = (w / 2.0) if is_portrait else (third_x1 if obj_cx < w / 2.0 else third_x2)
+                    targets.append(f"VLINE,{target_x/w:.4f},{obj_cx/w:.4f},{obj_cy/h:.4f}")
+                    if obj_cx - target_x > tol_x: return "Move Left (Align Object)", targets
+                    if target_x - obj_cx > tol_x: return "Move Right (Align Object)", targets
                 else:
-                    target_x = (w // 2) if is_portrait else (third_x1 if obj_cx < w // 2 else third_x2)
-                    target_y = third_y1 if obj_cy < h // 2 else third_y2
-                    if obj_cx - target_x > tol_x: return "Move Left (Align Object)"
-                    if target_x - obj_cx > tol_x: return "Move Right (Align Object)"
-                    if obj_cy - target_y > tol_y: return "Move Up (Align Object)"
-                    if target_y - obj_cy > tol_y: return "Move Down (Align Object)"
+                    target_x = (w / 2.0) if is_portrait else (third_x1 if obj_cx < w / 2.0 else third_x2)
+                    target_y = third_y1 if obj_cy < h / 2.0 else third_y2
+                    targets.append(f"POINT,{target_x/w:.4f},{target_y/h:.4f},{obj_cx/w:.4f},{obj_cy/h:.4f}")
+                    if obj_cx - target_x > tol_x: return "Move Left (Align Object)", targets
+                    if target_x - obj_cx > tol_x: return "Move Right (Align Object)", targets
+                    if obj_cy - target_y > tol_y: return "Move Up (Align Object)", targets
+                    if target_y - obj_cy > tol_y: return "Move Down (Align Object)", targets
                 
-                return "ALIGNED"
+                return "ALIGNED", targets
                 
             elif len(objects) == 2:
                 objects = sorted(objects, key=lambda o: o[0])
-                o1_cx = objects[0][0] + objects[0][2] // 2
-                if o1_cx - third_x1 > tol_x: return "Move Left (Balance Objects)"
-                if third_x1 - o1_cx > tol_x: return "Move Right (Balance Objects)"
+                o1_cx, o1_cy = objects[0][0] + objects[0][2] / 2.0, objects[0][1] + objects[0][3] / 2.0
+                o2_cx, o2_cy = objects[1][0] + objects[1][2] / 2.0, objects[1][1] + objects[1][3] / 2.0
                 
-                o2_cx = objects[1][0] + objects[1][2] // 2
-                if o2_cx - third_x2 > tol_x: return "Move Left (Balance Objects)"
-                if third_x2 - o2_cx > tol_x: return "Move Right (Balance Objects)"
+                targets.append(f"VLINE,{third_x1/w:.4f},{o1_cx/w:.4f},{o1_cy/h:.4f}")
+                targets.append(f"VLINE,{third_x2/w:.4f},{o2_cx/w:.4f},{o2_cy/h:.4f}")
                 
-                return "ALIGNED"
+                if o1_cx - third_x1 > tol_x: return "Move Left (Balance Objects)", targets
+                if third_x1 - o1_cx > tol_x: return "Move Right (Balance Objects)", targets
+                
+                if o2_cx - third_x2 > tol_x: return "Move Left (Balance Objects)", targets
+                if third_x2 - o2_cx > tol_x: return "Move Right (Balance Objects)", targets
+                
+                return "ALIGNED", targets
             
-        return ""
+        return "", targets
 
     def process_frame(self, frame_bgr_array, rotation_degrees=0):
         """
         Accepts a BGR numpy array from Kotlin/CameraX and applies native rotation.
-        Returns a dictionary containing feedback and bounding boxes.
+        Returns a dictionary containing feedback, bounding boxes, and normalized overlay coordinates.
         """
         # Apply CameraX hardware rotation
         if rotation_degrees == 90:
@@ -368,8 +393,11 @@ class CompositionAnalyzer:
             if confidence > 0.6:
                 box = face_detections[0, 0, i, 3:7] * np.array([w, h, w, h])
                 startX, startY, endX, endY = box.astype("int")
+                startX, startY = max(0, startX), max(0, startY)
+                endX, endY = min(w, endX), min(h, endY)
                 fw, fh = endX - startX, endY - startY
-                valid_faces.append([startX, startY, fw, fh])
+                if fw > 0 and fh > 0:
+                    valid_faces.append([startX, startY, fw, fh])
 
         # ==========================================
         # PHASE 2: STRUCTURAL DETECTION (SALIENCY)
@@ -469,14 +497,28 @@ class CompositionAnalyzer:
         # PHASE 4: STATEFUL TRACKING & OUTPUT
         # ==========================================
         stable_objects = self.tracker.update(current_detections, current_scores, w, h)
-        feedback_text = self._generate_feedback(valid_faces, stable_objects, w, h)
+        feedback_text, targets_list = self._generate_feedback_and_targets(valid_faces, stable_objects, w, h)
         is_aligned = feedback_text.startswith("ALIGNED")
+
+        # Serialize normalized [0, 1] boxes & anchor points for Kotlin Canvas overlay
+        faces_norm_str = ";".join([
+            f"{fx/w:.4f},{fy/h:.4f},{fw/w:.4f},{fh/h:.4f},{(fx + fw*0.5)/w:.4f},{(fy + fh*0.35)/h:.4f}"
+            for (fx, fy, fw, fh) in valid_faces
+        ])
+        objects_norm_str = ";".join([
+            f"{ox/w:.4f},{oy/h:.4f},{ow/w:.4f},{oh/h:.4f},{(ox + ow*0.5)/w:.4f},{(oy + oh*0.5)/h:.4f}"
+            for (ox, oy, ow, oh) in stable_objects
+        ])
+        targets_norm_str = ";".join(targets_list)
 
         return {
             "feedback_text": feedback_text,
             "is_aligned": is_aligned,
             "faces": valid_faces,
-            "objects": stable_objects
+            "objects": stable_objects,
+            "faces_norm": faces_norm_str,
+            "objects_norm": objects_norm_str,
+            "targets_norm": targets_norm_str
         }
 
     def process_frame_nv21(self, nv21_bytes: bytes, width: int, height: int, rotation_degrees: int) -> dict:
@@ -484,6 +526,22 @@ class CompositionAnalyzer:
         Fast JNI bridge. Converts the flat NV21 byte array from Android CameraX 
         into a BGR OpenCV numpy array, then applies hardware rotation.
         """
+        import time
+        start_total = time.time()
+        
         yuv = np.frombuffer(nv21_bytes, dtype=np.uint8).reshape((height + height // 2, width))
         frame_bgr = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_NV21)
-        return self.process_frame(frame_bgr, rotation_degrees)
+        
+        # --- BENCHMARK START ---
+        start_process = time.time()
+        result = self.process_frame(frame_bgr, rotation_degrees)
+        end_process = time.time()
+        
+        total_time = (end_process - start_total) * 1000.0
+        cv_time = (end_process - start_process) * 1000.0
+        jni_mem_time = total_time - cv_time
+        
+        print(f"[BENCHMARK] Composition | Total: {total_time:.1f}ms | JNI+YUV: {jni_mem_time:.1f}ms | CV: {cv_time:.1f}ms")
+        # -----------------------
+        
+        return result

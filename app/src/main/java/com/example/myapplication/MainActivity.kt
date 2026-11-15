@@ -92,6 +92,10 @@ import java.util.*
 import java.util.concurrent.Executors
 import kotlin.math.atan2
 import kotlin.math.roundToInt
+import android.graphics.BitmapFactory
+import androidx.compose.foundation.Image
+import androidx.compose.ui.graphics.asImageBitmap
+import kotlinx.coroutines.awaitCancellation
 
 // =========================================================================
 // TOP-LEVEL HELPER FUNCTIONS
@@ -113,34 +117,75 @@ fun assetFilePath(context: android.content.Context, assetName: String): String {
     return file.absolutePath
 }
 
+fun argmax(array: FloatArray): Int {
+    var maxIdx = 0
+    var maxVal = array[0]
+    for (i in 1 until array.size) {
+        if (array[i] > maxVal) {
+            maxVal = array[i]
+            maxIdx = i
+        }
+    }
+    return maxIdx
+}
 fun parseEffectPreset(context: android.content.Context, category: String, index: Int): String {
     try {
         val jsonString = context.assets.open("speech_effect_chain_v2.json").bufferedReader().use { it.readText() }
         val jsonObject = JSONObject(jsonString)
 
         val presetArray = jsonObject.getJSONArray(category)
-        val safeIndex = index.coerceIn(0, presetArray.length() - 1)
-        val preset = presetArray.getJSONObject(safeIndex)
 
+        // Fix #2: Throw explicit error instead of silently clamping
+        if (index < 0 || index >= presetArray.length()) {
+            throw IndexOutOfBoundsException("Model predicted index $index for $category, but array size is ${presetArray.length()}")
+        }
+
+        val preset = presetArray.getJSONObject(index)
         if (preset.getBoolean("bypass")) return "Bypassed"
 
         val effects = preset.getJSONArray("effects")
-        val firstEffect = effects.getJSONObject(0)
-        val type = firstEffect.getString("type")
-        val params = firstEffect.getJSONObject("params")
 
-        return when (type) {
-            "NoiseGate" -> "Noise Gate (Thresh: ${params.getDouble("threshold_db")}dB, Ratio: ${params.getDouble("ratio")}:1)"
-            "Compressor" -> "Compressor (Ratio: ${params.getDouble("ratio")}:1, Thresh: ${params.getDouble("threshold_db")}dB)"
-            "LowShelfFilter" -> "3-Band EQ (Low: ${params.getDouble("gain_db")}dB)"
-            "PeakFilter" -> "De-Esser (${params.getDouble("gain_db")}dB at ${params.getDouble("cutoff_frequency_hz")}Hz)"
-            "Reverb" -> "Reverb (Room Size: ${params.getDouble("room_size")}, Wet: ${params.getDouble("wet_level")})"
-            "Limiter" -> "Limiter (Thresh: ${params.getDouble("threshold_db")}dB)"
-            else -> "$type Applied"
+        // Fix #8: Safe JSON parsing using optJSONObject
+        return when (category) {
+            "de_noise_presets" -> {
+                val p = effects.optJSONObject(0)?.optJSONObject("params") ?: return "Applied (Params Missing)"
+                "Noise Gate (Thresh: ${p.optDouble("threshold_db")}dB, Ratio: ${p.optDouble("ratio")}:1, Attack: ${p.optDouble("attack_ms")}ms, Release: ${p.optDouble("release_ms")}ms)"
+            }
+            "dynamic_presets" -> {
+                val p = effects.optJSONObject(0)?.optJSONObject("params") ?: return "Applied (Params Missing)"
+                var gainStr = ""
+                if (effects.length() > 1) {
+                    val g = effects.optJSONObject(1)?.optJSONObject("params")
+                    if (g != null) gainStr = ", Makeup Gain: ${g.optDouble("gain_db")}dB"
+                }
+                "Compressor (Thresh: ${p.optDouble("threshold_db")}dB, Ratio: ${p.optDouble("ratio")}:1, Attack: ${p.optDouble("attack_ms")}ms, Release: ${p.optDouble("release_ms")}ms$gainStr)"
+            }
+            "eq_presets" -> {
+                val low = effects.optJSONObject(0)?.optJSONObject("params") ?: return "Applied (Params Missing)"
+                val high = effects.optJSONObject(1)?.optJSONObject("params")
+                val mid = effects.optJSONObject(2)?.optJSONObject("params")
+                "3-Band EQ\n" +
+                        "  Low: ${low.optDouble("gain_db")}dB @ ${low.optDouble("cutoff_frequency_hz")}Hz (Q: ${low.optDouble("q")})\n" +
+                        "  Mid: ${mid?.optDouble("gain_db")}dB @ ${mid?.optDouble("cutoff_frequency_hz")}Hz (Q: ${mid?.optDouble("q")})\n" +
+                        "  High: ${high?.optDouble("gain_db")}dB @ ${high?.optDouble("cutoff_frequency_hz")}Hz (Q: ${high?.optDouble("q")})"
+            }
+            "de_esser_presets" -> {
+                val p = effects.optJSONObject(0)?.optJSONObject("params") ?: return "Applied (Params Missing)"
+                "De-Esser (Cutoff: ${p.optDouble("cutoff_frequency_hz")}Hz, Gain: ${p.optDouble("gain_db")}dB, Q: ${p.optDouble("q")})"
+            }
+            "reverb_presets" -> {
+                val p = effects.optJSONObject(0)?.optJSONObject("params") ?: return "Applied (Params Missing)"
+                "Reverb (Room: ${p.optDouble("room_size")}, Damp: ${p.optDouble("damping")}, Wet: ${p.optDouble("wet_level")}, Dry: ${p.optDouble("dry_level")}, Width: ${p.optDouble("width")}, Freeze: ${p.optDouble("freeze_mode")})"
+            }
+            "limiter_presets" -> {
+                val p = effects.optJSONObject(0)?.optJSONObject("params") ?: return "Applied (Params Missing)"
+                "Limiter (Thresh: ${p.optDouble("threshold_db")}dB, Release: ${p.optDouble("release_ms")}ms)"
+            }
+            else -> "Applied"
         }
     } catch (e: Exception) {
         Log.e("JSON_PARSER", "Failed to parse $category", e)
-        return "Parse Error"
+        throw e // Propagate to surface the ML error
     }
 }
 
@@ -154,6 +199,7 @@ sealed class Screen {
     object Audio : Screen()
     object Gallery : Screen()
     data class Transcription(val filePath: String) : Screen()
+    data class ImageViewer(val filePath: String) : Screen() // New route for JPGs
 }
 
 class MainActivity : ComponentActivity() {
@@ -189,12 +235,47 @@ fun AppNavigation() {
             )
             is Screen.Gallery -> GalleryScreen(
                 onNavigateBack = { currentScreen = Screen.Home },
-                onNavigateToTranscription = { filePath -> currentScreen = Screen.Transcription(filePath) }
+                onNavigateToTranscription = { filePath -> currentScreen = Screen.Transcription(filePath) },
+                onNavigateToImageViewer = { filePath -> currentScreen = Screen.ImageViewer(filePath) }
             )
             is Screen.Transcription -> TranscriptionScreen(
                 filePath = screen.filePath,
                 onNavigateBack = { currentScreen = Screen.Gallery }
             )
+            is Screen.ImageViewer -> ImageViewerScreen(
+                filePath = screen.filePath,
+                onNavigateBack = { currentScreen = Screen.Gallery }
+            )
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun ImageViewerScreen(filePath: String, onNavigateBack: () -> Unit) {
+    val bitmap = remember(filePath) { BitmapFactory.decodeFile(filePath)?.asImageBitmap() }
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text("Image Viewer") },
+                navigationIcon = {
+                    IconButton(onClick = onNavigateBack) {
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                    }
+                }
+            )
+        }
+    ) { paddingValues ->
+        Box(
+            modifier = Modifier.fillMaxSize().padding(paddingValues).background(Color.Black),
+            contentAlignment = Alignment.Center
+        ) {
+            if (bitmap != null) {
+                Image(bitmap = bitmap, contentDescription = "Captured Image", modifier = Modifier.fillMaxSize())
+            } else {
+                Text("Failed to load image.", color = Color.White)
+            }
         }
     }
 }
@@ -270,7 +351,12 @@ fun VideoModeScreen(onNavigateBack: () -> Unit) {
         return
     }
 
-    val previewView = remember { PreviewView(context) }
+    val previewView = remember {
+        PreviewView(context).apply {
+            implementationMode = PreviewView.ImplementationMode.COMPATIBLE
+            scaleType = PreviewView.ScaleType.FILL_CENTER
+        }
+    }
     var camera by remember { mutableStateOf<Camera?>(null) }
     var videoCapture by remember { mutableStateOf<VideoCapture<Recorder>?>(null) }
     var imageCapture by remember { mutableStateOf<ImageCapture?>(null) }
@@ -319,14 +405,33 @@ fun VideoModeScreen(onNavigateBack: () -> Unit) {
         onDispose { sensorManager.unregisterListener(listener) }
     }
 
+    fun getCurrentDisplayRotation(): Int {
+        val displayManager = context.getSystemService(android.content.Context.DISPLAY_SERVICE) as android.hardware.display.DisplayManager
+        val display = displayManager.getDisplay(android.view.Display.DEFAULT_DISPLAY)
+        return display?.rotation ?: android.view.Surface.ROTATION_0
+    }
+
     LaunchedEffect(lifecycleOwner) {
         val cameraProvider = ProcessCameraProvider.getInstance(context).get()
-        val preview = Preview.Builder().build().also { it.setSurfaceProvider(previewView.surfaceProvider) }
-        previewUseCase = preview
-        val recorderBuilder = Recorder.Builder().setQualitySelector(QualitySelector.from(Quality.HIGHEST))
+        val initialRotation = getCurrentDisplayRotation()
 
-        videoCapture = VideoCapture.Builder(recorderBuilder.build()).build()
-        imageCapture = ImageCapture.Builder().build()
+        val preview = Preview.Builder()
+            .setTargetAspectRatio(AspectRatio.RATIO_16_9)
+            .setTargetRotation(initialRotation)
+            .build().also { it.setSurfaceProvider(previewView.surfaceProvider) }
+        previewUseCase = preview
+
+        val recorderBuilder = Recorder.Builder().setQualitySelector(QualitySelector.from(Quality.HIGHEST))
+        val videoCap = VideoCapture.Builder(recorderBuilder.build())
+            .setTargetRotation(initialRotation)
+            .build()
+        videoCapture = videoCap
+
+        val imgCap = ImageCapture.Builder()
+            .setTargetAspectRatio(AspectRatio.RATIO_16_9)
+            .setTargetRotation(initialRotation)
+            .build()
+        imageCapture = imgCap
 
         val py = try { Python.getInstance() } catch (e: Exception) { null }
         val expModule = py?.getModule("exposure_analyzer")
@@ -342,10 +447,16 @@ fun VideoModeScreen(onNavigateBack: () -> Unit) {
             }
         }
 
+        val currentRotAfterLoad = getCurrentDisplayRotation()
+        preview.targetRotation = currentRotAfterLoad
+        videoCap.targetRotation = currentRotAfterLoad
+        imgCap.targetRotation = currentRotAfterLoad
+
         val analyzerExecutor = Executors.newSingleThreadExecutor()
         val imageAnalysis = ImageAnalysis.Builder()
             .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-            .setTargetResolution(android.util.Size(640, 480))
+            .setTargetAspectRatio(AspectRatio.RATIO_16_9)
+            .setTargetRotation(currentRotAfterLoad)
             .build()
             .also { analysisUseCase ->
                 imageAnalysisUseCase = analysisUseCase
@@ -373,9 +484,42 @@ fun VideoModeScreen(onNavigateBack: () -> Unit) {
 
         try {
             cameraProvider.unbindAll()
-            camera = cameraProvider.bindToLifecycle(lifecycleOwner, CameraSelector.DEFAULT_BACK_CAMERA, preview, imageCapture, videoCapture, imageAnalysis)
+            camera = cameraProvider.bindToLifecycle(lifecycleOwner, CameraSelector.DEFAULT_BACK_CAMERA, preview, imgCap, videoCap, imageAnalysis)
+            awaitCancellation()
         } catch (exc: Exception) {
             Log.e("CameraX", "Binding failed", exc)
+        } finally {
+            cameraProvider.unbindAll()
+            analyzerExecutor.shutdown()
+        }
+    }
+
+    // Dynamically track all display rotation changes (including 90° and 180° landscape flips)
+    DisposableEffect(previewUseCase, imageCapture, imageAnalysisUseCase, videoCapture) {
+        val displayManager = context.getSystemService(android.content.Context.DISPLAY_SERVICE) as android.hardware.display.DisplayManager
+        val displayListener = object : android.hardware.display.DisplayManager.DisplayListener {
+            override fun onDisplayAdded(displayId: Int) {}
+            override fun onDisplayRemoved(displayId: Int) {}
+            override fun onDisplayChanged(displayId: Int) {
+                if (displayId == android.view.Display.DEFAULT_DISPLAY) {
+                    val rot = getCurrentDisplayRotation()
+                    previewUseCase?.targetRotation = rot
+                    imageCapture?.targetRotation = rot
+                    imageAnalysisUseCase?.targetRotation = rot
+                    videoCapture?.targetRotation = rot
+                    previewView.post { previewView.requestLayout() }
+                }
+            }
+        }
+        displayManager.registerDisplayListener(displayListener, null)
+        // Also sync immediately when use cases become non-null
+        val rot = getCurrentDisplayRotation()
+        previewUseCase?.targetRotation = rot
+        imageCapture?.targetRotation = rot
+        imageAnalysisUseCase?.targetRotation = rot
+        videoCapture?.targetRotation = rot
+        onDispose {
+            displayManager.unregisterDisplayListener(displayListener)
         }
     }
 
@@ -407,13 +551,150 @@ fun VideoModeScreen(onNavigateBack: () -> Unit) {
         AndroidView(factory = { previewView }, modifier = Modifier.fillMaxSize())
 
         Canvas(modifier = Modifier.fillMaxSize()) {
-            val w = size.width; val h = size.height
+            val w = size.width
+            val h = size.height
             val linePaint = Color.White.copy(alpha = 0.3f)
-            drawLine(linePaint, Offset(w / 3, 0f), Offset(w / 3, h), strokeWidth = 2f)
-            drawLine(linePaint, Offset(w * 2 / 3, 0f), Offset(w * 2 / 3, h), strokeWidth = 2f)
-            drawLine(linePaint, Offset(0f, h / 3), Offset(w, h / 3), strokeWidth = 2f)
-            drawLine(linePaint, Offset(0f, h * 2 / 3), Offset(w, h * 2 / 3), strokeWidth = 2f)
 
+            // 1. Base Rule-of-Thirds Grid
+            drawLine(linePaint, Offset(w / 3f, 0f), Offset(w / 3f, h), strokeWidth = 2f)
+            drawLine(linePaint, Offset(w * 2f / 3f, 0f), Offset(w * 2f / 3f, h), strokeWidth = 2f)
+            drawLine(linePaint, Offset(0f, h / 3f), Offset(w, h / 3f), strokeWidth = 2f)
+            drawLine(linePaint, Offset(0f, h * 2f / 3f), Offset(w, h * 2f / 3f), strokeWidth = 2f)
+
+            val isAligned = compositionFeedback["is_aligned"] == "True"
+            val targetGreen = Color(0xFF00E676)
+            val dashEffect = androidx.compose.ui.graphics.PathEffect.dashPathEffect(floatArrayOf(14f, 10f), 0f)
+
+            // 2. Green Target Crosshairs (POINT) & Green Target Grid Lines (HLINE / VLINE)
+            val targetsStr = compositionFeedback["targets_norm"] ?: ""
+            if (targetsStr.isNotEmpty()) {
+                targetsStr.split(";").forEach { item ->
+                    val parts = item.split(",")
+                    when (parts.firstOrNull()) {
+                        "POINT" -> if (parts.size >= 5) {
+                            val tx = (parts[1].toFloatOrNull() ?: 0.5f) * w
+                            val ty = (parts[2].toFloatOrNull() ?: 0.5f) * h
+                            val ax = (parts[3].toFloatOrNull() ?: 0.5f) * w
+                            val ay = (parts[4].toFloatOrNull() ?: 0.5f) * h
+
+                            // Dashed guiding vector from subject anchor to green target cross
+                            if (!isAligned) {
+                                drawLine(
+                                    color = targetGreen.copy(alpha = 0.75f),
+                                    start = Offset(ax, ay),
+                                    end = Offset(tx, ty),
+                                    strokeWidth = 3f,
+                                    pathEffect = dashEffect
+                                )
+                            }
+                            // Green Target Crosshair + Outer Ring
+                            val crossRadius = 26f
+                            drawLine(targetGreen, Offset(tx - crossRadius, ty), Offset(tx + crossRadius, ty), strokeWidth = 6f)
+                            drawLine(targetGreen, Offset(tx, ty - crossRadius), Offset(tx, ty + crossRadius), strokeWidth = 6f)
+                            drawCircle(
+                                color = targetGreen,
+                                radius = crossRadius * 0.75f,
+                                center = Offset(tx, ty),
+                                style = androidx.compose.ui.graphics.drawscope.Stroke(width = 3f)
+                            )
+                        }
+                        "HLINE" -> if (parts.size >= 4) {
+                            val ty = (parts[1].toFloatOrNull() ?: 0.3333f) * h
+                            val ax = (parts[2].toFloatOrNull() ?: 0.5f) * w
+                            val ay = (parts[3].toFloatOrNull() ?: 0.5f) * h
+
+                            // Highlight entire horizontal grid line in bright Green
+                            drawLine(targetGreen, Offset(0f, ty), Offset(w, ty), strokeWidth = 6f)
+                            if (!isAligned) {
+                                drawLine(
+                                    color = targetGreen.copy(alpha = 0.75f),
+                                    start = Offset(ax, ay),
+                                    end = Offset(ax, ty),
+                                    strokeWidth = 3f,
+                                    pathEffect = dashEffect
+                                )
+                            }
+                            // Small green cross at projection point on the line
+                            drawLine(targetGreen, Offset(ax - 18f, ty), Offset(ax + 18f, ty), strokeWidth = 5f)
+                            drawLine(targetGreen, Offset(ax, ty - 18f), Offset(ax, ty + 18f), strokeWidth = 5f)
+                        }
+                        "VLINE" -> if (parts.size >= 4) {
+                            val tx = (parts[1].toFloatOrNull() ?: 0.3333f) * w
+                            val ax = (parts[2].toFloatOrNull() ?: 0.5f) * w
+                            val ay = (parts[3].toFloatOrNull() ?: 0.5f) * h
+
+                            // Highlight entire vertical grid line in bright Green
+                            drawLine(targetGreen, Offset(tx, 0f), Offset(tx, h), strokeWidth = 6f)
+                            if (!isAligned) {
+                                drawLine(
+                                    color = targetGreen.copy(alpha = 0.75f),
+                                    start = Offset(ax, ay),
+                                    end = Offset(tx, ay),
+                                    strokeWidth = 3f,
+                                    pathEffect = dashEffect
+                                )
+                            }
+                            // Small green cross at projection point on the line
+                            drawLine(targetGreen, Offset(tx - 18f, ay), Offset(tx + 18f, ay), strokeWidth = 5f)
+                            drawLine(targetGreen, Offset(tx, ay - 18f), Offset(tx, ay + 18f), strokeWidth = 5f)
+                        }
+                    }
+                }
+            }
+
+            // 3. Salient Object Bounding Boxes & Center Anchor Dots
+            val objectsStr = compositionFeedback["objects_norm"] ?: ""
+            if (objectsStr.isNotEmpty()) {
+                val objColor = if (isAligned) targetGreen else Color(0xFFFFBF00)
+                objectsStr.split(";").forEach { item ->
+                    val coords = item.split(",")
+                    if (coords.size >= 6) {
+                        val bx = (coords[0].toFloatOrNull() ?: 0f) * w
+                        val by = (coords[1].toFloatOrNull() ?: 0f) * h
+                        val bw = (coords[2].toFloatOrNull() ?: 0f) * w
+                        val bh = (coords[3].toFloatOrNull() ?: 0f) * h
+                        val ax = (coords[4].toFloatOrNull() ?: 0f) * w
+                        val ay = (coords[5].toFloatOrNull() ?: 0f) * h
+
+                        drawRect(
+                            color = objColor,
+                            topLeft = Offset(bx, by),
+                            size = androidx.compose.ui.geometry.Size(bw, bh),
+                            style = androidx.compose.ui.graphics.drawscope.Stroke(width = 4.5f)
+                        )
+                        drawCircle(color = objColor, radius = 8f, center = Offset(ax, ay))
+                    }
+                }
+            }
+
+            // 4. Face Bounding Boxes & Eye-Level Headroom Anchor Ticks
+            val facesStr = compositionFeedback["faces_norm"] ?: ""
+            if (facesStr.isNotEmpty()) {
+                val faceColor = if (isAligned) targetGreen else Color.Cyan
+                facesStr.split(";").forEach { item ->
+                    val coords = item.split(",")
+                    if (coords.size >= 6) {
+                        val fx = (coords[0].toFloatOrNull() ?: 0f) * w
+                        val fy = (coords[1].toFloatOrNull() ?: 0f) * h
+                        val fw = (coords[2].toFloatOrNull() ?: 0f) * w
+                        val fh = (coords[3].toFloatOrNull() ?: 0f) * h
+                        val ax = (coords[4].toFloatOrNull() ?: 0f) * w
+                        val ay = (coords[5].toFloatOrNull() ?: 0f) * h
+
+                        drawRect(
+                            color = faceColor,
+                            topLeft = Offset(fx, fy),
+                            size = androidx.compose.ui.geometry.Size(fw, fh),
+                            style = androidx.compose.ui.graphics.drawscope.Stroke(width = 5f)
+                        )
+                        // Eye-level headroom anchor marker
+                        drawLine(faceColor, Offset(ax - 20f, ay), Offset(ax + 20f, ay), strokeWidth = 4f)
+                        drawCircle(color = faceColor, radius = 8f, center = Offset(ax, ay))
+                    }
+                }
+            }
+
+            // 5. Gravity-Driven Digital Horizon Level
             val display = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) context.display else (context.getSystemService(android.content.Context.WINDOW_SERVICE) as android.view.WindowManager).defaultDisplay
             val angleOffset = when(display?.rotation) { android.view.Surface.ROTATION_90 -> 90f; android.view.Surface.ROTATION_180 -> 180f; android.view.Surface.ROTATION_270 -> -90f; else -> 0f }
             val angle = rotationAngle.floatValue - angleOffset
@@ -636,74 +917,273 @@ fun RecordTab(context: android.content.Context) {
     var recordingJob by remember { mutableStateOf<Job?>(null) }
     val scope = rememberCoroutineScope()
 
+    // Real-time acoustic diagnostic states
+    var primaryAudioAction by remember { mutableStateOf("Ready to monitor acoustic environment") }
+    var primaryAudioColor by remember { mutableStateOf("WHITE") }
+    var secondaryAudioAction by remember { mutableStateOf("") }
+    var liveRmsDb by remember { mutableFloatStateOf(-60f) }
+    var livePeakDb by remember { mutableFloatStateOf(-60f) }
+    var liveSnrDb by remember { mutableFloatStateOf(0f) }
+
     LaunchedEffect(isRecording) { while (isRecording) { delay(1000); recordTime++ } }
     DisposableEffect(Unit) { onDispose { recordingJob?.cancel() } }
 
     val infiniteTransition = rememberInfiniteTransition(label = "pulse")
-    val scale by infiniteTransition.animateFloat(initialValue = 1f, targetValue = if (isRecording) 1.2f else 1f, animationSpec = infiniteRepeatable(animation = tween(800, easing = LinearEasing), repeatMode = RepeatMode.Reverse), label = "pulse_anim")
+    val scale by infiniteTransition.animateFloat(
+        initialValue = 1f,
+        targetValue = if (isRecording) 1.2f else 1f,
+        animationSpec = infiniteRepeatable(animation = tween(800, easing = LinearEasing), repeatMode = RepeatMode.Reverse),
+        label = "pulse_anim"
+    )
 
-    Column(modifier = Modifier.fillMaxSize(), verticalArrangement = Arrangement.Center, horizontalAlignment = Alignment.CenterHorizontally) {
-        Text(text = String.format(Locale.US, "%02d:%02d", recordTime / 60, recordTime % 60), style = MaterialTheme.typography.displayLarge, fontWeight = FontWeight.Light, color = if (isRecording) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface)
-        Spacer(modifier = Modifier.height(48.dp))
-        Row(horizontalArrangement = Arrangement.spacedBy(24.dp), verticalAlignment = Alignment.CenterVertically) {
-            Box(
-                modifier = Modifier.size(100.dp).scale(scale).clip(CircleShape).background(if (isRecording) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary).clickable {
-                    if (!isRecording) {
-                        val outputFile = File(context.getExternalFilesDir(null), "AUDIO_${System.currentTimeMillis()}.wav")
-                        recordingJob = scope.launch(Dispatchers.IO) {
-                            val sampleRate = 44100
-                            val channelConfig = AudioFormat.CHANNEL_IN_MONO
-                            val audioFormat = AudioFormat.ENCODING_PCM_16BIT
-                            val bufferSize = AudioRecord.getMinBufferSize(sampleRate, channelConfig, audioFormat)
-                            val audioRecord = AudioRecord(MediaRecorder.AudioSource.MIC, sampleRate, channelConfig, audioFormat, bufferSize)
-
-                            if (audioRecord.state != AudioRecord.STATE_INITIALIZED) return@launch
-                            val out = FileOutputStream(outputFile)
-                            out.write(ByteArray(44))
-                            val buffer = ByteArray(bufferSize)
-                            audioRecord.startRecording()
-                            var totalAudioLen = 0L
-
-                            try {
-                                while (isActive) {
-                                    val read = audioRecord.read(buffer, 0, bufferSize)
-                                    if (read > 0) { out.write(buffer, 0, read); totalAudioLen += read }
-                                }
-                            } finally {
-                                audioRecord.stop(); audioRecord.release()
-                                val totalDataLen = totalAudioLen + 36
-                                val byteRate = 16 * sampleRate * 1 / 8
-                                val header = ByteArray(44)
-                                header[0] = 'R'.code.toByte(); header[1] = 'I'.code.toByte(); header[2] = 'F'.code.toByte(); header[3] = 'F'.code.toByte()
-                                header[4] = (totalDataLen and 0xff).toByte(); header[5] = ((totalDataLen shr 8) and 0xff).toByte(); header[6] = ((totalDataLen shr 16) and 0xff).toByte(); header[7] = ((totalDataLen shr 24) and 0xff).toByte()
-                                header[8] = 'W'.code.toByte(); header[9] = 'A'.code.toByte(); header[10] = 'V'.code.toByte(); header[11] = 'E'.code.toByte()
-                                header[12] = 'f'.code.toByte(); header[13] = 'm'.code.toByte(); header[14] = 't'.code.toByte(); header[15] = ' '.code.toByte()
-                                header[16] = 16; header[17] = 0; header[18] = 0; header[19] = 0
-                                header[20] = 1; header[21] = 0; header[22] = 1; header[23] = 0
-                                header[24] = (sampleRate and 0xff).toByte(); header[25] = ((sampleRate shr 8) and 0xff).toByte(); header[26] = 0; header[27] = 0
-                                header[28] = (byteRate and 0xff).toByte(); header[29] = ((byteRate shr 8) and 0xff).toByte(); header[30] = 0; header[31] = 0
-                                header[32] = (1 * 16 / 8).toByte(); header[33] = 0; header[34] = 16; header[35] = 0
-                                header[36] = 'd'.code.toByte(); header[37] = 'a'.code.toByte(); header[38] = 't'.code.toByte(); header[39] = 'a'.code.toByte()
-                                header[40] = (totalAudioLen and 0xff).toByte(); header[41] = ((totalAudioLen shr 8) and 0xff).toByte(); header[42] = ((totalAudioLen shr 16) and 0xff).toByte(); header[43] = ((totalAudioLen shr 24) and 0xff).toByte()
-                                val randomAccessFile = java.io.RandomAccessFile(outputFile, "rw")
-                                randomAccessFile.seek(0); randomAccessFile.write(header); randomAccessFile.close(); out.close()
-                            }
-                        }
-                        isRecording = true
-                    } else {
-                        recordingJob?.cancel(); recordingJob = null; isRecording = false; recordTime = 0; Toast.makeText(context, "Audio Saved (.wav)", Toast.LENGTH_SHORT).show()
-                    }
-                }, contentAlignment = Alignment.Center
-            ) { Icon(imageVector = if (!isRecording) Icons.Default.Mic else Icons.Default.Stop, contentDescription = "Record", tint = Color.White, modifier = Modifier.size(40.dp)) }
+    Column(
+        modifier = Modifier.fillMaxSize().padding(horizontal = 20.dp),
+        verticalArrangement = Arrangement.SpaceBetween,
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        // Top Real-Time Acoustic Diagnostic Banner (matching VideoModeScreen style)
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(top = 16.dp)
+                .background(Color.Black.copy(alpha = 0.75f), RoundedCornerShape(12.dp))
+                .padding(16.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Text(
+                text = primaryAudioAction,
+                color = when (primaryAudioColor) {
+                    "RED" -> Color.Red
+                    "AMBER" -> Color(0xFFFFBF00)
+                    "GREEN" -> Color.Green
+                    else -> Color.White
+                },
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold,
+                textAlign = TextAlign.Center
+            )
+            if (secondaryAudioAction.isNotEmpty()) {
+                Spacer(modifier = Modifier.height(6.dp))
+                Text(
+                    text = secondaryAudioAction,
+                    color = Color.Cyan,
+                    style = MaterialTheme.typography.bodyMedium,
+                    textAlign = TextAlign.Center
+                )
+            }
+            if (isRecording) {
+                Spacer(modifier = Modifier.height(10.dp))
+                Text(
+                    text = String.format(Locale.US, "[Peak: %.1f dBFS | RMS: %.1f dBFS | Est. SNR: %.1f dB]", livePeakDb, liveRmsDb, liveSnrDb),
+                    color = Color.White.copy(alpha = 0.8f),
+                    style = MaterialTheme.typography.labelSmall
+                )
+                Spacer(modifier = Modifier.height(6.dp))
+                // Live dBFS Meter Bar (-60 dBFS to 0 dBFS)
+                val meterFraction = ((liveRmsDb + 60f) / 60f).coerceIn(0f, 1f)
+                LinearProgressIndicator(
+                    progress = { meterFraction },
+                    modifier = Modifier.fillMaxWidth().height(8.dp).clip(RoundedCornerShape(4.dp)),
+                    color = when {
+                        livePeakDb > -1.0f -> Color.Red
+                        liveRmsDb < -35.0f -> Color(0xFFFFBF00)
+                        else -> Color.Green
+                    },
+                    trackColor = Color.DarkGray
+                )
+            }
         }
+
+        // Center Timer & Record Button
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Text(
+                text = String.format(Locale.US, "%02d:%02d", recordTime / 60, recordTime % 60),
+                style = MaterialTheme.typography.displayLarge,
+                fontWeight = FontWeight.Light,
+                color = if (isRecording) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface
+            )
+            Spacer(modifier = Modifier.height(36.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(24.dp), verticalAlignment = Alignment.CenterVertically) {
+                Box(
+                    modifier = Modifier
+                        .size(100.dp)
+                        .scale(scale)
+                        .clip(CircleShape)
+                        .background(if (isRecording) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary)
+                        .clickable {
+                            if (!isRecording) {
+                                isRecording = true
+                                val outputFile = File(context.getExternalFilesDir(null), "AUDIO_${System.currentTimeMillis()}.wav")
+                                recordingJob = scope.launch(Dispatchers.IO) {
+                                    val sampleRate = 44100
+                                    val channelConfig = AudioFormat.CHANNEL_IN_MONO
+                                    val audioFormat = AudioFormat.ENCODING_PCM_16BIT
+                                    val minBuf = AudioRecord.getMinBufferSize(sampleRate, channelConfig, audioFormat)
+                                    // Use ~50ms chunks (4410 bytes = 2205 16-bit samples) for responsive real-time metering
+                                    val bufferSize = maxOf(minBuf, 4410)
+                                    val audioRecord = AudioRecord(MediaRecorder.AudioSource.MIC, sampleRate, channelConfig, audioFormat, bufferSize)
+
+                                    if (audioRecord.state != AudioRecord.STATE_INITIALIZED) return@launch
+                                    val out = FileOutputStream(outputFile)
+                                    out.write(ByteArray(44)) // Placeholder for WAV header
+                                    val buffer = ByteArray(bufferSize)
+                                    audioRecord.startRecording()
+                                    var totalAudioLen = 0L
+
+                                    // Rolling buffers for real-time SNR & Reverberation tail diagnostics
+                                    val rmsHistory = ArrayDeque<Float>() // Last 50 frames (~2.5 seconds)
+                                    val decaySlopes = ArrayDeque<Float>() // Post-peak 150ms decay drops
+                                    var holdClipFrames = 0
+
+                                    try {
+                                        while (isActive) {
+                                            val read = audioRecord.read(buffer, 0, bufferSize)
+                                            if (read > 0) {
+                                                out.write(buffer, 0, read)
+                                                totalAudioLen += read
+
+                                                // --- REAL-TIME ACOUSTIC DIAGNOSTICS ---
+                                                val nSamples = read / 2
+                                                if (nSamples > 0) {
+                                                    var sumSq = 0.0
+                                                    var maxAbs = 0
+                                                    var i = 0
+                                                    while (i < read - 1) {
+                                                        val s = ((buffer[i + 1].toInt() shl 8) or (buffer[i].toInt() and 0xFF)).toShort().toInt()
+                                                        val absS = if (s < 0) -s else s
+                                                        if (absS > maxAbs) maxAbs = absS
+                                                        val norm = s / 32768.0
+                                                        sumSq += norm * norm
+                                                        i += 2
+                                                    }
+                                                    val rmsLin = kotlin.math.sqrt(sumSq / nSamples).coerceAtLeast(1e-6)
+                                                    val peakLin = (maxAbs / 32768.0).coerceAtLeast(1e-6)
+                                                    val frameRmsDb = (20.0 * kotlin.math.log10(rmsLin)).toFloat()
+                                                    val framePeakDb = (20.0 * kotlin.math.log10(peakLin)).toFloat()
+
+                                                    rmsHistory.addLast(frameRmsDb)
+                                                    if (rmsHistory.size > 50) rmsHistory.removeFirst()
+
+                                                    val sortedRms = rmsHistory.sorted()
+                                                    val p10Noise = sortedRms[(sortedRms.size * 0.10).toInt().coerceIn(0, sortedRms.size - 1)]
+                                                    val p90Speech = sortedRms[(sortedRms.size * 0.90).toInt().coerceIn(0, sortedRms.size - 1)]
+                                                    val estSnr = (p90Speech - p10Noise).coerceAtLeast(0f)
+
+                                                    // Check 3-frame (150ms) post-syllable decay rate for room reverberation
+                                                    if (rmsHistory.size >= 6) {
+                                                        val histList = rmsHistory.toList()
+                                                        val nH = histList.size
+                                                        val prevPeak = histList[nH - 4]
+                                                        val currTail = histList[nH - 1]
+                                                        // If 3 frames ago was an active syllable peak and speaker stopped
+                                                        if (prevPeak > p90Speech - 3.0f && currTail < prevPeak - 2.0f && estSnr >= 12.0f) {
+                                                            val dropDb = prevPeak - currTail
+                                                            decaySlopes.addLast(dropDb)
+                                                            if (decaySlopes.size > 8) decaySlopes.removeFirst()
+                                                        }
+                                                    }
+                                                    val avgDecayDrop = if (decaySlopes.size >= 3) decaySlopes.average().toFloat() else 15.0f
+
+                                                    if (framePeakDb > -0.6f) holdClipFrames = 12
+                                                    else if (holdClipFrames > 0) holdClipFrames--
+
+                                                    val (pAction, pColor) = when {
+                                                        holdClipFrames > 0 ->
+                                                            "SEVERE CLIPPING. Move microphone further away." to "RED"
+                                                        rmsHistory.size >= 15 && p10Noise > -36.0f ->
+                                                            "HIGH BACKGROUND NOISE. Move to a quieter location." to "AMBER"
+                                                        rmsHistory.size >= 20 && estSnr < 11.0f && p90Speech > -42.0f ->
+                                                            "LOW SNR (< 11 dB). Too much ambient noise." to "AMBER"
+                                                        rmsHistory.size >= 20 && p90Speech < -34.0f ->
+                                                            "WEAK VOICE SIGNAL. Move microphone closer to speaker." to "AMBER"
+                                                        else ->
+                                                            "Acoustic Level Locked." to "GREEN"
+                                                    }
+
+                                                    val sAction = if (decaySlopes.size >= 3 && avgDecayDrop < 8.5f && estSnr >= 12.0f) {
+                                                        "HIGH ROOM REVERBERATION. Acoustic tail detected; move closer."
+                                                    } else {
+                                                        ""
+                                                    }
+
+                                                    liveRmsDb = frameRmsDb
+                                                    livePeakDb = framePeakDb
+                                                    liveSnrDb = estSnr
+                                                    primaryAudioAction = pAction
+                                                    primaryAudioColor = pColor
+                                                    secondaryAudioAction = sAction
+                                                }
+                                            }
+                                        }
+                                    } finally {
+                                        audioRecord.stop()
+                                        audioRecord.release()
+
+                                        val totalDataLen = totalAudioLen + 36
+                                        val byteRate = sampleRate * 2
+
+                                        val header = ByteBuffer.allocate(44).order(ByteOrder.LITTLE_ENDIAN).apply {
+                                            put("RIFF".toByteArray(Charsets.US_ASCII))
+                                            putInt(totalDataLen.toInt())
+                                            put("WAVE".toByteArray(Charsets.US_ASCII))
+                                            put("fmt ".toByteArray(Charsets.US_ASCII))
+                                            putInt(16)
+                                            putShort(1.toShort())
+                                            putShort(1.toShort())
+                                            putInt(sampleRate)
+                                            putInt(byteRate)
+                                            putShort(2.toShort())
+                                            putShort(16.toShort())
+                                            put("data".toByteArray(Charsets.US_ASCII))
+                                            putInt(totalAudioLen.toInt())
+                                        }.array()
+
+                                        val randomAccessFile = java.io.RandomAccessFile(outputFile, "rw")
+                                        randomAccessFile.seek(0)
+                                        randomAccessFile.write(header)
+                                        randomAccessFile.close()
+                                        out.close()
+
+                                        kotlinx.coroutines.withContext(Dispatchers.Main) {
+                                            primaryAudioAction = "Recording saved. Ready for on-device AI analysis."
+                                            primaryAudioColor = "WHITE"
+                                            secondaryAudioAction = ""
+                                            Toast.makeText(context, "Audio Saved (.wav)", Toast.LENGTH_SHORT).show()
+                                        }
+                                    }
+                                }
+                            } else {
+                                isRecording = false
+                                recordTime = 0
+                                recordingJob?.cancel()
+                                recordingJob = null
+                            }
+                        },
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        imageVector = if (!isRecording) Icons.Default.Mic else Icons.Default.Stop,
+                        contentDescription = "Record",
+                        tint = Color.White,
+                        modifier = Modifier.size(40.dp)
+                    )
+                }
+            }
+            Spacer(modifier = Modifier.height(24.dp))
+            Text(
+                text = if (isRecording) "Recording & monitoring acoustics..." else "Tap microphone to start recording",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+
         Spacer(modifier = Modifier.height(24.dp))
-        Text(text = if (isRecording) "Recording..." else "Tap to start", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun GalleryScreen(onNavigateBack: () -> Unit, onNavigateToTranscription: (String) -> Unit) {
+fun GalleryScreen(onNavigateBack: () -> Unit, onNavigateToTranscription: (String) -> Unit, onNavigateToImageViewer: (String) -> Unit) {
     val context = LocalContext.current
     var selectedTab by remember { mutableIntStateOf(0) }
     val tabs = listOf("Images & Videos", "Audio")
@@ -713,7 +1193,7 @@ fun GalleryScreen(onNavigateBack: () -> Unit, onNavigateToTranscription: (String
             PrimaryTabRow(selectedTabIndex = selectedTab) { tabs.forEachIndexed { index, title -> Tab(selected = selectedTab == index, onClick = { selectedTab = index }, text = { Text(title, fontWeight = FontWeight.SemiBold) }) } }
             AnimatedContent(targetState = selectedTab, label = "GalleryTabs") { tab ->
                 when (tab) {
-                    0 -> VisualLibraryTab(context, onNavigateToTranscription)
+                    0 -> VisualLibraryTab(context, onNavigateToTranscription, onNavigateToImageViewer)
                     1 -> AudioLibraryTab(context, onNavigateToTranscription)
                 }
             }
@@ -722,7 +1202,7 @@ fun GalleryScreen(onNavigateBack: () -> Unit, onNavigateToTranscription: (String
 }
 
 @Composable
-fun VisualLibraryTab(context: android.content.Context, onNavigateToTranscription: (String) -> Unit) {
+fun VisualLibraryTab(context: android.content.Context, onNavigateToTranscription: (String) -> Unit, onNavigateToImageViewer: (String) -> Unit) {
     val mediaDir = context.getExternalFilesDir(null)
     val visuals = mediaDir?.listFiles { file -> file.extension == "jpg" || file.extension == "mp4" }?.sortedByDescending { it.lastModified() }?.map { it.name } ?: emptyList()
 
@@ -730,7 +1210,14 @@ fun VisualLibraryTab(context: android.content.Context, onNavigateToTranscription
         LazyColumn(modifier = Modifier.fillMaxSize().padding(16.dp)) {
             items(visuals) { fileName ->
                 val isVideo = fileName.endsWith(".mp4")
-                ElevatedCard(modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp), onClick = { onNavigateToTranscription(File(mediaDir, fileName).absolutePath) }, colors = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.surface)) {
+                ElevatedCard(
+                    modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp),
+                    onClick = {
+                        val path = File(mediaDir, fileName).absolutePath
+                        if (isVideo) onNavigateToTranscription(path) else onNavigateToImageViewer(path)
+                    },
+                    colors = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.surface)
+                ) {
                     Row(modifier = Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
                         Icon(if (isVideo) Icons.Default.Videocam else Icons.Default.Image, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
                         Spacer(modifier = Modifier.width(16.dp))
@@ -772,16 +1259,28 @@ fun AudioLibraryTab(context: android.content.Context, onNavigateToTranscription:
 fun TranscriptionScreen(filePath: String, onNavigateBack: () -> Unit) {
     val context = LocalContext.current
     val isAudio = filePath.endsWith(".wav")
-    val exoPlayer = remember { ExoPlayer.Builder(context).build().apply { setMediaItem(MediaItem.fromUri(filePath)); prepare() } }
+    val exoPlayer = remember {
+        ExoPlayer.Builder(context).build().apply {
+            setMediaItem(MediaItem.fromUri(filePath))
+            prepare()
+        }
+    }
 
     DisposableEffect(Unit) { onDispose { exoPlayer.release() } }
 
     var showTranscription by remember { mutableStateOf(true) }
     var showSettings by remember { mutableStateOf(true) }
 
-    // PyTorch States
+    // PyTorch & Limiter States
     var effectPresets by remember { mutableStateOf<Map<String, String>?>(null) }
+    var predictedIndices by remember { mutableStateOf<IntArray?>(null) }
     var isAnalyzing by remember { mutableStateOf(false) }
+    var mlErrorMessage by remember { mutableStateOf<String?>(null) }
+
+    // On-Device DSP Rendering & A/B Playback States
+    var isRenderingAudio by remember { mutableStateOf(false) }
+    var enhancedFilePath by remember { mutableStateOf<String?>(null) }
+    var isPlayingEnhanced by remember { mutableStateOf(false) }
 
     // Vosk States
     var transcriptionText by remember { mutableStateOf("") }
@@ -791,42 +1290,118 @@ fun TranscriptionScreen(filePath: String, onNavigateBack: () -> Unit) {
         topBar = {
             TopAppBar(
                 title = { Text(if (isAudio) "Audio Analytics" else "Video Analytics") },
-                navigationIcon = { IconButton(onClick = onNavigateBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back") } }
+                navigationIcon = {
+                    IconButton(onClick = onNavigateBack) {
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                    }
+                }
             )
         }
     ) { paddingValues ->
         Column(modifier = Modifier.fillMaxSize().padding(paddingValues).padding(16.dp)) {
-            Box(modifier = Modifier.fillMaxWidth().height(if (isAudio) 80.dp else 200.dp).clip(RoundedCornerShape(12.dp)).background(Color.Black)) {
-                AndroidView(factory = { ctx ->
-                    PlayerView(ctx).apply {
-                        player = exoPlayer
-                        if (isAudio) {
-                            setShowBuffering(PlayerView.SHOW_BUFFERING_NEVER)
-                            controllerAutoShow = true
-                            controllerShowTimeoutMs = -1
-                            useArtwork = false
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(if (isAudio) 80.dp else 200.dp)
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(Color.Black)
+            ) {
+                AndroidView(
+                    factory = { ctx ->
+                        PlayerView(ctx).apply {
+                            player = exoPlayer
+                            if (isAudio) {
+                                setShowBuffering(PlayerView.SHOW_BUFFERING_NEVER)
+                                controllerAutoShow = true
+                                controllerShowTimeoutMs = -1
+                                useArtwork = false
+                            }
                         }
-                    }
-                }, modifier = Modifier.fillMaxSize())
+                    },
+                    modifier = Modifier.fillMaxSize()
+                )
             }
+
+            // A/B Playback Toggle when Enhanced Audio has been rendered
+            if (enhancedFilePath != null) {
+                Spacer(modifier = Modifier.height(10.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    FilledTonalButton(
+                        onClick = {
+                            if (isPlayingEnhanced) {
+                                isPlayingEnhanced = false
+                                exoPlayer.setMediaItem(MediaItem.fromUri(filePath))
+                                exoPlayer.prepare()
+                                exoPlayer.play()
+                            }
+                        },
+                        modifier = Modifier.weight(1f),
+                        colors = ButtonDefaults.filledTonalButtonColors(
+                            containerColor = if (!isPlayingEnhanced) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant
+                        )
+                    ) {
+                        Text("Original (Raw)", fontWeight = if (!isPlayingEnhanced) FontWeight.Bold else FontWeight.Normal)
+                    }
+                    FilledTonalButton(
+                        onClick = {
+                            if (!isPlayingEnhanced) {
+                                isPlayingEnhanced = true
+                                exoPlayer.setMediaItem(MediaItem.fromUri(enhancedFilePath!!))
+                                exoPlayer.prepare()
+                                exoPlayer.play()
+                            }
+                        },
+                        modifier = Modifier.weight(1f),
+                        colors = ButtonDefaults.filledTonalButtonColors(
+                            containerColor = if (isPlayingEnhanced) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant
+                        )
+                    ) {
+                        Text("Enhanced (AI DSP)", fontWeight = if (isPlayingEnhanced) FontWeight.Bold else FontWeight.Normal)
+                    }
+                }
+            }
+
             Spacer(modifier = Modifier.height(16.dp))
 
             LazyColumn(modifier = Modifier.fillMaxSize()) {
                 item {
-                    Text("File: ${File(filePath).name}", style = MaterialTheme.typography.bodyMedium)
+                    val activeFileName = if (isPlayingEnhanced && enhancedFilePath != null) {
+                        File(enhancedFilePath!!).name
+                    } else {
+                        File(filePath).name
+                    }
+                    Text("Playing: $activeFileName", style = MaterialTheme.typography.bodyMedium)
                     Spacer(modifier = Modifier.height(16.dp))
                 }
 
                 if (!isAudio) {
                     item {
-                        Box(modifier = Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surfaceVariant, RoundedCornerShape(8.dp)).padding(16.dp)) {
-                            Text("Transcription and Acoustic Post-Production Presets are only available for .wav audio recordings.", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .background(MaterialTheme.colorScheme.surfaceVariant, RoundedCornerShape(8.dp))
+                                .padding(16.dp)
+                        ) {
+                            Text(
+                                "Transcription and Acoustic Preset Recommendations are only available for .wav audio recordings. Raw audio files are never altered.",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
                         }
                     }
                 } else {
                     item {
-                        ElevatedCard(onClick = { showTranscription = !showTranscription }, modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)) {
-                            Row(modifier = Modifier.padding(16.dp).fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                        ElevatedCard(
+                            onClick = { showTranscription = !showTranscription },
+                            modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(16.dp).fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
                                 Text("Transcription", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary)
                                 Icon(if (showTranscription) Icons.Default.ExpandLess else Icons.Default.ExpandMore, contentDescription = null)
                             }
@@ -834,20 +1409,30 @@ fun TranscriptionScreen(filePath: String, onNavigateBack: () -> Unit) {
                     }
                     item {
                         AnimatedVisibility(visible = showTranscription) {
-                            Box(modifier = Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surfaceVariant, RoundedCornerShape(8.dp)).padding(16.dp)) {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .background(MaterialTheme.colorScheme.surfaceVariant, RoundedCornerShape(8.dp))
+                                    .padding(16.dp)
+                            ) {
                                 if (transcriptionText.isNotEmpty()) {
                                     Text(transcriptionText, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                                 } else {
                                     Button(
                                         onClick = {
                                             isTranscribing = true
-                                            loadVoskModel(context,
+                                            loadVoskModel(
+                                                context,
                                                 { model ->
                                                     kotlinx.coroutines.CoroutineScope(Dispatchers.IO).launch {
                                                         try {
+                                                            val wavFile = File(filePath)
+                                                            val audioDurationSeconds = (wavFile.length() - 44) / 88200.0
+                                                            val voskStartTime = System.currentTimeMillis()
+
                                                             val recognizer = Recognizer(model, 44100f)
-                                                            val fis = FileInputStream(File(filePath))
-                                                            fis.skip(44) // Skip the standard WAV header
+                                                            val fis = FileInputStream(wavFile)
+                                                            fis.skip(44)
 
                                                             val buffer = ByteArray(4096)
                                                             var bytesRead: Int
@@ -866,6 +1451,10 @@ fun TranscriptionScreen(filePath: String, onNavigateBack: () -> Unit) {
                                                             if (finalText.isNotEmpty()) fullText.append(finalText)
 
                                                             fis.close()
+
+                                                            val voskProcessingTime = (System.currentTimeMillis() - voskStartTime) / 1000.0
+                                                            val voskRtf = voskProcessingTime / audioDurationSeconds
+                                                            Log.d("ThesisBenchmark", "VOSK RTF: $voskRtf (Audio: ${audioDurationSeconds}s, Time: ${voskProcessingTime}s)")
 
                                                             kotlinx.coroutines.withContext(Dispatchers.Main) {
                                                                 transcriptionText = fullText.toString().ifEmpty { "No recognizable speech detected." }
@@ -898,30 +1487,121 @@ fun TranscriptionScreen(filePath: String, onNavigateBack: () -> Unit) {
                         Spacer(modifier = Modifier.height(16.dp))
                     }
                     item {
-                        ElevatedCard(onClick = { showSettings = !showSettings }, modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)) {
-                            Row(modifier = Modifier.padding(16.dp).fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                                Text("Acoustic Post-Production Presets", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary)
+                        ElevatedCard(
+                            onClick = { showSettings = !showSettings },
+                            modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(16.dp).fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Text("Acoustic Preset Recommendations", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary)
                                 Icon(if (showSettings) Icons.Default.ExpandLess else Icons.Default.ExpandMore, contentDescription = null)
                             }
                         }
                     }
                     item {
                         AnimatedVisibility(visible = showSettings) {
-                            Box(modifier = Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surfaceVariant, RoundedCornerShape(8.dp)).padding(16.dp)) {
-                                if (effectPresets != null) {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .background(MaterialTheme.colorScheme.surfaceVariant, RoundedCornerShape(8.dp))
+                                    .padding(16.dp)
+                            ) {
+                                if (mlErrorMessage != null) {
+                                    Column {
+                                        Text("Analysis Error:", color = MaterialTheme.colorScheme.error, fontWeight = FontWeight.Bold)
+                                        Text(mlErrorMessage!!, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+                                        Spacer(modifier = Modifier.height(8.dp))
+                                        Button(onClick = { mlErrorMessage = null }) { Text("Dismiss & Retry") }
+                                    }
+                                } else if (effectPresets != null) {
                                     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                                        Text("Denoise: ${effectPresets!!["denoise"]}", fontWeight = FontWeight.SemiBold)
-                                        Text("Dynamic: ${effectPresets!!["compressor"]}")
-                                        Text("EQ: ${effectPresets!!["eq"]}")
-                                        Text("De-Esser: ${effectPresets!!["deesser"]}")
-                                        Text("Space: ${effectPresets!!["reverb"]}")
+                                        Text(
+                                            "White-Box DAW Parameters (or render directly on device):",
+                                            style = MaterialTheme.typography.labelMedium,
+                                            color = MaterialTheme.colorScheme.primary
+                                        )
+                                        Text("Denoise: ${effectPresets?.get("denoise") ?: ""}")
+                                        Text("Dynamic: ${effectPresets?.get("compressor") ?: ""}")
+                                        Text("EQ: ${effectPresets?.get("eq") ?: ""}")
+                                        Text("De-Esser: ${effectPresets?.get("deesser") ?: ""}")
+                                        Text("Space: ${effectPresets?.get("reverb") ?: ""}")
+                                        Text("Limiter: ${effectPresets?.get("limiter") ?: ""}")
+
+                                        Spacer(modifier = Modifier.height(8.dp))
+
+                                        Button(
+                                            onClick = {
+                                                val indices = predictedIndices ?: return@Button
+                                                isRenderingAudio = true
+                                                kotlinx.coroutines.CoroutineScope(Dispatchers.IO).launch {
+                                                    try {
+                                                        val jsonString = context.assets.open("speech_effect_chain_v2.json").bufferedReader().use { it.readText() }
+                                                        val inFile = File(filePath)
+                                                        val outName = if (inFile.name.startsWith("ENHANCED_")) {
+                                                            inFile.name
+                                                        } else {
+                                                            "ENHANCED_${inFile.name}"
+                                                        }
+                                                        val outFile = File(inFile.parentFile, outName)
+
+                                                        val py = Python.getInstance()
+                                                        val renderer = py.getModule("audio_renderer").callAttr("AudioRenderer")
+                                                        val savedPath = renderer.callAttr(
+                                                            "render_preset_chain",
+                                                            inFile.absolutePath,
+                                                            outFile.absolutePath,
+                                                            jsonString,
+                                                            indices[0],
+                                                            indices[1],
+                                                            indices[2],
+                                                            indices[3],
+                                                            indices[4],
+                                                            indices[5]
+                                                        ).toString()
+
+                                                        kotlinx.coroutines.withContext(Dispatchers.Main) {
+                                                            enhancedFilePath = savedPath
+                                                            isPlayingEnhanced = true
+                                                            isRenderingAudio = false
+                                                            exoPlayer.setMediaItem(MediaItem.fromUri(savedPath))
+                                                            exoPlayer.prepare()
+                                                            exoPlayer.play()
+                                                            Toast.makeText(context, "Saved & Playing: $outName", Toast.LENGTH_SHORT).show()
+                                                        }
+                                                    } catch (e: Exception) {
+                                                        Log.e("AUDIO_RENDER", "Failed to render audio", e)
+                                                        kotlinx.coroutines.withContext(Dispatchers.Main) {
+                                                            isRenderingAudio = false
+                                                            Toast.makeText(context, "Render failed: ${e.localizedMessage}", Toast.LENGTH_LONG).show()
+                                                        }
+                                                    }
+                                                }
+                                            },
+                                            modifier = Modifier.fillMaxWidth(),
+                                            enabled = !isRenderingAudio
+                                        ) {
+                                            Icon(Icons.Default.AutoFixHigh, contentDescription = null)
+                                            Spacer(modifier = Modifier.width(8.dp))
+                                            Text(
+                                                if (isRenderingAudio) "Rendering 6-Stage DSP Chain..."
+                                                else if (enhancedFilePath != null) "Re-Render & Play Enhanced Audio (.wav)"
+                                                else "Render & Play Enhanced Audio (.wav)"
+                                            )
+                                        }
                                     }
                                 } else {
                                     Button(
                                         onClick = {
                                             isAnalyzing = true
+                                            mlErrorMessage = null
                                             kotlinx.coroutines.CoroutineScope(Dispatchers.IO).launch {
                                                 try {
+                                                    val wavFile = File(filePath)
+                                                    val audioDurationSeconds = (wavFile.length() - 44) / 88200.0
+                                                    val cnnStartTime = System.currentTimeMillis()
+
                                                     val py = Python.getInstance()
                                                     val audioProcessor = py.getModule("audio_preprocessor").callAttr("AudioPreprocessor")
                                                     val pythonBytes = audioProcessor.callAttr("process_wav_to_tensor", filePath).toJava(ByteArray::class.java)
@@ -936,34 +1616,46 @@ fun TranscriptionScreen(filePath: String, onNavigateBack: () -> Unit) {
                                                     val inputTensor = Tensor.fromBlob(spectrogramArray, longArrayOf(1, 1, 513, 1723))
                                                     val outputTuple = module.forward(IValue.from(inputTensor)).toTuple()
 
-                                                    val denoiseIdx = outputTuple[0].toTensor().dataAsFloatArray[0].roundToInt()
-                                                    val compIdx = outputTuple[1].toTensor().dataAsFloatArray[0].roundToInt()
-                                                    val eqIdx = outputTuple[2].toTensor().dataAsFloatArray[0].roundToInt()
-                                                    val deesserIdx = outputTuple[3].toTensor().dataAsFloatArray[0].roundToInt()
-                                                    val reverbIdx = outputTuple[4].toTensor().dataAsFloatArray[0].roundToInt()
+                                                    val denoiseIdx = argmax(outputTuple[0].toTensor().dataAsFloatArray)
+                                                    val compIdx = argmax(outputTuple[1].toTensor().dataAsFloatArray)
+                                                    val eqIdx = argmax(outputTuple[2].toTensor().dataAsFloatArray)
+                                                    val deesserIdx = argmax(outputTuple[3].toTensor().dataAsFloatArray)
+                                                    val reverbIdx = argmax(outputTuple[4].toTensor().dataAsFloatArray)
+
+                                                    // Evaluate 6th stage (Limiter) via O(N) 4x local-oversampling True Peak & P_ceiling
+                                                    val limiterIdx = audioProcessor.callAttr("recommend_limiter_idx", filePath, compIdx, eqIdx).toInt()
+
+                                                    val cnnProcessingTime = (System.currentTimeMillis() - cnnStartTime) / 1000.0
+                                                    val cnnRtf = cnnProcessingTime / audioDurationSeconds
+                                                    Log.d("ThesisBenchmark", "CNN RTF: $cnnRtf (Audio: ${audioDurationSeconds}s, Time: ${cnnProcessingTime}s)")
 
                                                     val results = mapOf(
                                                         "denoise" to parseEffectPreset(context, "de_noise_presets", denoiseIdx),
                                                         "compressor" to parseEffectPreset(context, "dynamic_presets", compIdx),
                                                         "eq" to parseEffectPreset(context, "eq_presets", eqIdx),
                                                         "deesser" to parseEffectPreset(context, "de_esser_presets", deesserIdx),
-                                                        "reverb" to parseEffectPreset(context, "reverb_presets", reverbIdx)
+                                                        "reverb" to parseEffectPreset(context, "reverb_presets", reverbIdx),
+                                                        "limiter" to parseEffectPreset(context, "limiter_presets", limiterIdx)
                                                     )
 
                                                     kotlinx.coroutines.withContext(Dispatchers.Main) {
+                                                        predictedIndices = intArrayOf(denoiseIdx, compIdx, eqIdx, deesserIdx, reverbIdx, limiterIdx)
                                                         effectPresets = results
                                                         isAnalyzing = false
                                                     }
                                                 } catch (e: Exception) {
                                                     Log.e("ML_PIPELINE", "Error processing audio", e)
-                                                    kotlinx.coroutines.withContext(Dispatchers.Main) { isAnalyzing = false }
+                                                    kotlinx.coroutines.withContext(Dispatchers.Main) {
+                                                        mlErrorMessage = e.localizedMessage ?: "Unknown ML Error"
+                                                        isAnalyzing = false
+                                                    }
                                                 }
                                             }
                                         },
                                         modifier = Modifier.fillMaxWidth(),
                                         enabled = !isAnalyzing
                                     ) {
-                                        Text(if (isAnalyzing) "Processing Spectrogram & Analyzing..." else "Generate Master Presets")
+                                        Text(if (isAnalyzing) "Analyzing Spectrogram..." else "Generate Recommended Presets")
                                     }
                                 }
                             }

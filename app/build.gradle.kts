@@ -60,7 +60,7 @@ android {
 chaquopy {
     defaultConfig {
         version = "3.8"
-        buildPython("C:/Users/Kyros Lialios/AppData/Local/Programs/Python/Python38/python.exe")
+        buildPython("python3")
         pip {
             install("opencv-contrib-python-headless")
             install("numpy")
@@ -102,6 +102,7 @@ dependencies {
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
     testImplementation(libs.junit)
+    testImplementation("org.json:json:20210307")
     androidTestImplementation(platform(libs.androidx.compose.bom))
     androidTestImplementation(libs.androidx.compose.ui.test.junit4)
     androidTestImplementation(libs.androidx.espresso.core)
