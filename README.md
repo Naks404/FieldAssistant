@@ -6,7 +6,7 @@ Source code, formative evaluation benchmarks, HPC dataset enrichment scripts, an
 > **Author:** Kyriazis Lialios — School of Electrical and Computer Engineering, Aristotle University of Thessaloniki (2026)  
 > **Supervisor:** Prof. Charalampos Dimoulas
 
-- **Enriched Speech DSP Dataset & Trained Model (Zenodo DOI):** https://doi.org/10.5281/zenodo.XXXXXXX
+- **Enriched Speech DSP Dataset & Trained Model (Zenodo DOI):** https://doi.org/10.5281/zenodo.24530146
 
 ---
 
